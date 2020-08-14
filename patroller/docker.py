@@ -30,9 +30,9 @@ class DockerIdentityResolver(IdentityResolver):
         container = pid_to_container(pid)
 
         if container is None:
-            return None, None
+            return None
 
-        return self._extract_identity(container), container
+        return self._extract_identity(container)
 
     def _extract_identity(self, container):
 
@@ -41,7 +41,7 @@ class DockerIdentityResolver(IdentityResolver):
             ct = self._docker.containers.get(container)
             labels = ct.labels
 
-            for name in DockerIdentityManager.IDENTIFIER_LABELS:
+            for name in DockerIdentityResolver.IDENTIFIER_LABELS:
                 if name in labels:
                     name, address = parseaddr(labels[name])
                     if address:
@@ -58,9 +58,9 @@ class DockerIdentityResolver(IdentityResolver):
         container = self._find_container(address)
 
         if container is None:
-            return None, None
+            return None
 
-        return self._extract_identity(container), container
+        return self._extract_identity(container)
 
     @cached(TTLCache(100, 5))
     def _find_container(self, address):

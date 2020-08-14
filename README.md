@@ -1,2 +1,4 @@
 
-Keeping order on multi-user multi-GPU machines. Work in progress.
+Keeping order on multi-user multi-resource machines. Work in progress.
+
+

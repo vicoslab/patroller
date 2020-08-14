@@ -7,12 +7,13 @@ RUN apt-get update --fix-missing && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONPATH=/code
-ENV PATROLLER_TEST=1
 
 ADD patroller /code/patroller
 ADD requirements.txt /code/
 
 RUN pip3 install -r /code/requirements.txt
+
+EXPOSE 80
 
 ENTRYPOINT ["python3", "-m", "patroller" ]
 

@@ -100,7 +100,7 @@ class DMon(ProcessLineReader):
             return
         try:
             device_id = int(tokens[0])
-            device_uuid = self._node.find(device_id)
+            device_uuid = self._monitor.find(device_id)
             self._monitor.find(device_id).update(power=parse_int(tokens[1]), gtemp=parse_int(tokens[2]),
                 mtemp=parse_int(tokens[3]), sm=parse_int(tokens[4]), mem=parse_int(tokens[5]), enc=parse_int(tokens[6]),
                 dec=parse_int(tokens[7]), mclk=parse_int(tokens[8]), pclk=parse_int(tokens[9]))
@@ -112,7 +112,7 @@ class PMon(ProcessLineReader):
     def __init__(self, monitor):
         super().__init__([SMI_BINARY, "pmon"])
         self._monitor = monitor
-        self._claim_signal = signal("claim")
+        self._access_signal = signal("access")
 
     def line(self, line):
         if line.startswith("#"):
@@ -123,15 +123,15 @@ class PMon(ProcessLineReader):
 
         try:
             device_id = int(tokens[0])
-            gpu = self._manager.find(device_id)
+            gpu = self._monitor.find(device_id)
 
             if tokens[1] == "-":
-                self._claim_signal.send(device=gpu.uuid)
+                self._access_signal.send(self._monitor, device=gpu.uuid, process=None)
                 return
 
             pid = int(tokens[1])
 
-            self._claim_signal.send(process=pid, device=gpu.uuid)
+            self._access_signal.send(self._monitor, device=gpu.uuid, process=pid)
 
         except ValueError as e:
             print(e)
