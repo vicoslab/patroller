@@ -1,7 +1,7 @@
 
 
-from patroller import run_node
+from patroller import run
 
 if __name__ == "__main__":
 
-    run_node()
+    run()

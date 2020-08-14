@@ -1,287 +1,57 @@
 
-import subprocess
 import logging
 import io
-from threading import Thread, Lock, RLock
-import xml.etree.ElementTree as ET
-from copy import copy
+import os
+import sys
 from datetime import datetime
 import json
-from email.utils import parseaddr
+import asyncio
 
-from flask import Flask, Response
-import docker
+from blinker import signal
+
+import tornado.httpserver
+from tornado.ioloop import IOLoop
+import tornado.web
+
 from cachetools import TTLCache, cached
 
-SMI_BINARY = "nvidia-smi"
+logger = logging.getLogger("patroller")
 
-logger = logging.getLogger("gpu")
-
-def parse_int(s):
-    if s == "-":
-        return None
-    else:
-        return int(s)
-
-def pid_to_container(pid):
-    container = None
-    with open("/proc/%d/cgroup" % pid) as fp:
-        for line in fp:
-            line = line.strip()
-            _, subsys, name = line.split(':', 2)
-            if subsys == "cpuset" and name.startswith("/docker/"):
-                container = name[8:]
-    return container
-
-class GPU(object):
-
-    ATTRIBUTES = ["name", "brand", "number"]
-
-    STATS = ["power", "gtemp", "mtemp", "sm", "mem", "enc", "dec", "mclk", "pclk"]
-
-    def __init__(self, uuid, **kwargs):
-        self._uuid = uuid
-        self._stats = {n: None for n in GPU.STATS}
-        self._attributes = {k: v for k, v in kwargs.items() if k in GPU.ATTRIBUTES}
-        self._updated = None
-        self._lock = Lock()
-
-    def __getattr__(self, name):
-        if name in GPU.ATTRIBUTES:
-            return self._attributes[name]
-        elif name in GPU.STATS:
-            with self._lock:
-                return self._stats[name]
-        else:
-            return super().__getattribute__(name)
-
-    @property
-    def updated(self):
-        return self._updated
-
-    @property
-    def uuid(self):
-        return self._uuid
-
-    def update(self, **kwargs):
-        with self._lock:
-            for k, v in kwargs.items():
-                if not k in GPU.STATS:
-                    raise RuntimeError("Illegal attribute")
-                self._stats[k] = v
-            self._updated = datetime.now()
-
-    def stats(self):
-        with self._lock:
-            data = copy(self._stats)
-            data["updated"] = self._updated.isoformat()
-            return data
-
-    def info(self):        
-        return copy(self._attributes)
-
+from patroller.base import IdentityResolver, TestDeviceMonitor
 
 class Node(object):
 
-    def __init__(self):
-        response = subprocess.check_output([SMI_BINARY, "-q", "-x"])
-        doc = ET.parse(io.StringIO(response.decode("utf-8")))
-        self._gpus = dict()
-        for gpu in doc.getroot().iter("gpu"):
-            name = gpu.find("product_name").text
-            brand = gpu.find("product_brand").text
-            uuid = gpu.find("uuid").text
-            number = int(gpu.find("minor_number").text)
-            self._gpus[uuid] = GPU(uuid, name=name, brand=brand, number=number)
-
-    def __iter__(self):
-        return iter(self._gpus.values())
-
-    def __getitem__(self, uuid):
-        if isinstance(uuid, str):
-            return self._gpus[uuid]
-        uuid = self.resolve(uuid)
-        return self._gpus[uuid]
-
-    def resolve(self, number):
-        for uuid, gpu in self._gpus.items():
-            if gpu.number == number:
-                return uuid
-        return None
-
-class Monitor(Thread):
-
-    def __init__(self, process):
-        super().__init__()
-        self._process = process
-        self._run = True
-
-    def stop(self):
-        self._run = False
-
-    def line(self, line):
-        pass
-
-    def run(self):
-        smi = subprocess.Popen(self._process, stdout=subprocess.PIPE)
-
-        while smi and self._run:
-            line = smi.stdout.readline().decode("utf-8").strip()
-            self.line(line)
-
-class DMon(Monitor):
-
-    def __init__(self, node):
-        super().__init__([SMI_BINARY, "dmon"])
-        self._node = node
-
-    def line(self, line):
-        if line.startswith("#"):
-            return
-        tokens = line.split()
-        if len(tokens) < 10:
-            return
-        try:
-            device_id = int(tokens[0])
-            self._node[device_id].update(power=parse_int(tokens[1]), gtemp=parse_int(tokens[2]),
-                mtemp=parse_int(tokens[3]), sm=parse_int(tokens[4]), mem=parse_int(tokens[5]), enc=parse_int(tokens[6]),
-                dec=parse_int(tokens[7]), mclk=parse_int(tokens[8]), pclk=parse_int(tokens[9]))
-        except ValueError as e:
-            print(e)
-
-class PMon(Monitor):
-
-    def __init__(self, node, identity_manager, reservation_manager):
-        super().__init__([SMI_BINARY, "pmon"])
-        self._node = node
-        self._identifier = identity_manager
-        self._reservations = reservation_manager
-
-    def line(self, line):
-        if line.startswith("#"):
-            return
-        tokens = line.split()
-        if len(tokens) < 8:
-            return
-
-        try:
-            device_id = int(tokens[0])
-
-            device_uuid = self._node.resolve(device_id)
-
-            if tokens[1] == "-":
-                self._reservations.claim(device_uuid, None)
-                return
-
-            pid = int(tokens[1])
-
-            user, container = self._identifier(pid)
-
-            if container is None:
-                logger.warning("Unable to identify container for process %d", pid)
-            elif user is None:
-                logger.warning("Unable to identify user for container %s", container)
-            else:
-                if not self._reservations.claim(device_uuid, user, pid):
-                    logger.warning("Tresspassing process on device %d (%s): %d", device_id, device_uuid, pid)
-
-        except ValueError as e:
-            print(e)
-
-class DockerIdentityManager(object):
-
-    IDENTIFIER_LABELS = ["vicos.user.email", "user.email", "email", "maintainer"]
-
-    def __init__(self):
-        super().__init__()
-        self._cache = {}
-        self._docker = docker.from_env()
-
-    def __call__(self, token):
-        if isinstance(token, str):
-            return self.identify_ip(token)
-        else:
-            return self.identify_pid(token)
-
-    def identify_pid(self, pid):
-
-        container = pid_to_container(pid)
-
-        if container is None:
-            return None, None
-
-        return self._extract_identity(container), container
-
-    def _extract_identity(self, container):
-
-        try:
-
-            ct = self._docker.containers.get(container)
-            labels = ct.labels
-
-            for name in DockerIdentityManager.IDENTIFIER_LABELS:
-                if name in labels:
-                    name, address = parseaddr(labels[name])
-                    if address:
-                        self._cache[container] = address
-                    break
-
-        except docker.errors.NotFound:
-            return None
-
-        if container in self._cache:
-            return self._cache[container]
-
-    def identify_ip(self, address):
-        container = self._find_container(address)
-
-        if container is None:
-            return None, None
-
-        return self._extract_identity(container), container
-
-    @cached(TTLCache(100, 5))
-    def _find_container(self, address):
-        for container in self._docker.containers.list():
-            networks = container.attrs['NetworkSettings'].get('Networks', {})
-            for _, network in networks.items():
-                if network["IPAddress"] == address:
-                    return container.id
-        return None
-
-class ReservationManager(object):
-
-    class Reservation(object):
+    class Claim(object):
 
         def __init__(self, user=None):
             self._user = user
             self._since = datetime.now()
             self._update = datetime.now()
             self._processes = []
-    
+
         @property
         def user(self):
             return self._user
 
         @property
         def age(self):
-            return (datetime.now()-self._since).total_seconds()
+            return (datetime.now() - self._since).total_seconds()
 
         @property
         def updated(self):
-            return (datetime.now()-self._update).total_seconds()
+            return (datetime.now() - self._update).total_seconds()
 
         @property
-        def claims(self):
+        def processes(self):
             return list(self._processes)
 
         @property
-        def free(self):
-            return self._user is None
+        def reservation(self):
+            return len(self._processes) == 0
 
         @property
-        def empty(self):
-            return len(self._processes) == 0
+        def free(self):
+            return self._user == None
 
         def claim(self, pid):
             if pid is None:
@@ -290,111 +60,225 @@ class ReservationManager(object):
                 self._processes.append(pid)
                 self._update = datetime.now()
 
-    def __init__(self, node, lease=10):
+
+    def __init__(self, *monitors, lease=10, resolver=IdentityResolver()):
         super().__init__()
-        self._node = node
         self._lease = lease
-        self._reservations = {device.uuid : ReservationManager.Reservation() for device in node}
-        self._lock = RLock()
+        self._resolver = resolver
+        self._devices = dict()
+        self._pending = []
+        signal("claim").connect( self._handle_claim_signal)
+        for monitor in monitors:
+            for device in monitor:
+                self._devices[device.uuid] = device
+                logger.info("Adding device %s", device.uuid)
+        self._claims = {k: Node.Claim() for k, _ in self._devices.items()}
+        self._cleanup()
 
-    def cleanup(self):
-        with self._lock:
-            for uuid, r in self._reservations.items():
-                if r.empty and r.updated > self._lease:
-                    self._reservations[uuid] = ReservationManager.Reservation()
+    def __iter__(self):
+        return iter(self._devices.values())
 
-    def reserve(self, user, count):
-        with self._lock:
-            self.cleanup()
+    def __getitem__(self, uuid):
+        return self._devices[uuid]
 
-            free = [(r.number, uuid) for uuid, r in self._reservations.items() if r.free]
+    def _handle_claim_signal(self, **kwargs):
+        IOLoop.current().add_callback(self._handle_claim, **kwargs)
+
+    def _handle_claim(self, device, process=None):
+        gpu = self._manager.find(device_id)
+
+        if process is None:
+            self.claim(device_uuid)
+
+        else:
+
+            user = self._resolver(process)
+
+            if user is None:
+                logger.warning("Unable to identify user for process %d", pid)
+            else:
+                if not self.claim(device_uuid, user, pid):
+                    logger.warning("Trespassing process %d on device %s detected.", device_uuid, pid)
+
+    def _cleanup(self):
+        change = False
+        for uuid, r in self._claims.items():
+            if r.reservation and r.updated > self._lease:
+                self._claims[uuid] = Node.Claim()
+                change = True
+
+        def process_pending(pending):
+            try:
+                devices = self.reserve(pending[1], pending[2])
+
+                if devices is not None:
+                    pending[0].set_result(devices)
+                    return False
+
+            except Exception as ex:
+                pending[0].set_exception(ex)
+                return False
+
+            return True
+
+        if change and self._pending:
+            self._pending[:] = [x for x in self._pending if process_pending(x)]
+
+        IOLoop.current().call_later(1, self._cleanup)
+
+    def wait(self, user, requirements):
+        future = asyncio.Future()
+        self._pending.append((future, user, requirements))
+
+        return future
+
+    def reserve(self, user, requirements):
+
+        devices = []
+
+        for group, count in requirements.items():
+            filtered = [uuid for uuid, device in self._devices.items() if device.group == group]
+
+            if len(filtered) < count:
+                raise RuntimeError("Insufficient number of devices available")
+
+            free = [uuid for uuid in filtered if self._claims[uuid].free]
 
             if len(free) < count:
-                return False
-            
-            reserve = free[:count]
-            for r in reserve:
-                self._reservations[r] = ReservationManager.Reservation(user)
+                return None
 
-            return reserve
+            devices.extend(free[:count])
+
+        for uuid in devices:
+            self._claims[uuid] = Node.Claim(user)
+
+        return {self._devices[uuid] for uuid in devices}
 
     def claim(self, uuid, user, pid=None):
-        with self._lock:
-            if user == self._reservations[uuid].user:
-                self._reservations[uuid].claim(pid)
-                return True
-            if user is None or self._reservations[uuid].free:
-                self._reservations[uuid] = ReservationManager.Reservation(user)
-                if pid is not None:
-                    self._reservations[uuid].claim(pid)
-                return True
-            return False
+        if user == self._claims[uuid].user:
+            self._claims[uuid].claim(pid)
+            return True
+        if user is None or self._claims[uuid].free:
+            self._claims[uuid] = Node.Claim(user)
+            if pid is not None:
+                self._claims[uuid].claim(pid)
+            return True
+        return False
 
     def status(self, uuid):
-        with self._lock:
-            res = self._reservations[uuid]
-            return dict(user=res.user, age=res.age, processes=res.claims)
+        claim = self._claims[uuid]
+        return dict(user=claim.user, age=claim.age, processes=claim.processes)
 
-def run_node():
+    def resolve(self, token):
+        return self._resolver(token)
 
-    node = Node()
+class APIHandler(tornado.web.RequestHandler):
 
-    identifier = DockerIdentityManager()
-    reservations = ReservationManager(node)
+    def initialize(self, node):
+        self.node = node
 
-    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    def set_default_headers(self):
+        self.set_header("Content-Type", 'application/json')
 
-    app = Flask("gpumonitor")
-    dmon = DMon(node)
-    pmon = PMon(node, identifier, reservations)
+    def write_error(self, status_code: int, **kwargs):
+        self.finish(json.dumps({"code": status_code, "message": self._reason}))
 
-    @app.route("/status")
-    def status():
+class StatusHandler(APIHandler):
 
-        data = {}
-        for gpu in node:
-            data[gpu.uuid] = gpu.stats()
-            data[gpu.uuid]["claim"] = reservations.status(gpu.uuid)
-
-        return Response(json.dumps(data), mimetype="application/json")
-
-
-    @app.route("/devices")
-    def devices():
+    def get(self):
 
         data = {}
-        for gpu in node:
-            data[gpu.uuid] = gpu.info()
+        for device in self.node:
+            data[device.uuid] = device.stats()
+            data[device.uuid]["claim"] = self.node.status(device.uuid)
 
-        return Response(json.dumps(data), mimetype="application/json")
+        self.write(json.dumps(data))
 
+class DevicesHandler(APIHandler):
 
-    @app.route("/request")
-    def request():
-        client_ip = request.remote_addr
-        count = int(request.args.get("count", 1))
+    def get(self):
 
-        user = identifier(client_ip)
+        data = {}
+        for device in self.node:
+            data[device.uuid] = device.info()
+            data[device.uuid]["group"] = device.group
+
+        self.write(json.dumps(data))
+
+class DeviceRequestHandler(APIHandler):
+
+    def initialize(self, node, block = False):
+        super().initialize(node)
+        self._block = block
+
+    async def get(self):
+
+        client_ip = self.request.remote_ip
+
+        user = self.node.resolve(client_ip)
 
         if user is None:
-            data = {"error": "Devices not available at the moment"}
-            return Response(json.dumps(data), mimetype="application/json"), 404
+            data = {"error": "Unable to determine user, aborting"}
+            self.set_status(404)
+            self.finish(json.dumps(data))
+            return
 
-        devices = reservations.reserve(user, count)
+        requirements = dict()
+        for group in self.request.query_arguments:
+            requirements[group] = int(self.get_query_argument(group, 0))
 
-        devices = [dict(number=x[0], uuid=x[1]) for x in devices]
+        try:
 
-        return Response(json.dumps(data), mimetype="application/json")
+            if self._block:
+                devices = await self.node.wait(user, requirements)
+            else:
+                devices = self.node.reserve(user, requirements)
+                if devices is None:
+                    data = {"error": "Currently unavailable"}
+                    self.set_status(404)
+                    self.finish(json.dumps(data))
+                    return
 
-    dmon.start()
-    pmon.start()
+            data = [dict(info=device.info(), uuid=device.uuid, group=device.group) for device in devices]
+
+            self.finish(json.dumps(data))
+
+        except RuntimeError as e:
+            data = {"error": str(e)}
+            self.set_status(404)
+            self.finish(json.dumps(data))
+            return
+
+def run():
+
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+
+    if "PATROLLER_TEST" in os.environ:
+        logger.setLevel(logging.DEBUG)
+        monitors = [TestDeviceMonitor(8)]
+        resolver = IdentityResolver()
+    else:
+        from patroller.docker import DockerIdentityResolver
+        from patroller.gpu import GPUMonitor
+        resolver = DockerIdentityResolver()
+        monitors = [GPUMonitor()]
+
+    node = Node(*monitors, resolver=resolver)
+
+    app = tornado.web.Application([
+        (r"/status", StatusHandler, dict(node=node)),
+        (r"/devices", DevicesHandler, dict(node=node)),
+        (r"/request", DeviceRequestHandler, dict(node=node)),
+        (r"/wait", DeviceRequestHandler, dict(node=node, block=True)),
+    ])
+
+    for monitor in monitors:
+        monitor.start()
     try:
-        app.run(host="0.0.0.0", port=6868)
+        app.listen(6868)
+        IOLoop.current().start()
     except KeyboardInterrupt:
         pass
-    dmon.stop()
-    pmon.stop()
-    dmon.join()
-    pmon.join()
-
+    for monitor in monitors:
+        monitor.stop()
 
