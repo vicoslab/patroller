@@ -30,6 +30,7 @@ class Node(object):
             self._since = datetime.now()
             self._update = datetime.now()
             self._processes = []
+            self._unclaimed = True
 
         @property
         def user(self):
@@ -49,7 +50,7 @@ class Node(object):
 
         @property
         def reservation(self):
-            return len(self._processes) == 0 and not self.free
+            return self._unclaimed and not self.free
 
         @property
         def free(self):
@@ -61,6 +62,7 @@ class Node(object):
                     self._processes = []
                     self._update = datetime.now()
             elif pid not in self._processes:
+                self._unclaimed = False
                 self._processes.append(pid)
                 self._update = datetime.now()
 
@@ -287,10 +289,15 @@ def run():
     else:
         from patroller.docker import DockerIdentityResolver
         from patroller.gpu import GPUMonitor
-        resolver = DockerIdentityResolver()
+
+        user_labels = None if not "PATROLLER_USER_LABELS" in os.environ else os.environ["PATROLLER_USER_LABELS"].split(",")
+
+        resolver = DockerIdentityResolver(user_labels)
         monitors = [GPUMonitor()]
 
-    node = Node(*monitors, resolver=resolver)
+    lease_time = 10 if not "PATROLLER_LEASE" in os.environ else int(os.environ["PATROLLER_LEASE"])
+
+    node = Node(*monitors, resolver=resolver, lease=lease_time)
 
     app = tornado.web.Application([
         (r"/status", StatusHandler, dict(node=node)),

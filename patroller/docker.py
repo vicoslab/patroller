@@ -18,12 +18,14 @@ def pid_to_container(pid):
 
 class DockerIdentityResolver(IdentityResolver):
 
-    IDENTIFIER_LABELS = ["vicos.user.email", "user.email", "email", "maintainer"]
-
-    def __init__(self):
+    def __init__(self, user_labels=None):
         super().__init__()
         self._cache = {}
         self._docker = docker.from_env()
+        if user_labels is None:
+            self._labels = ["user.email", "email", "maintainer"]
+        else:
+            self._labels = user_labels
 
     def identify_process(self, pid):
 
@@ -41,7 +43,7 @@ class DockerIdentityResolver(IdentityResolver):
             ct = self._docker.containers.get(container)
             labels = ct.labels
 
-            for name in DockerIdentityResolver.IDENTIFIER_LABELS:
+            for name in self._labels:
                 if name in labels:
                     name, address = parseaddr(labels[name])
                     if address:
