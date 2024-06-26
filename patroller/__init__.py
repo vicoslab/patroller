@@ -178,7 +178,7 @@ class Node(object):
             self._claims[uuid] = Node.Claim(user)
             if pid is not None:
                 self._claims[uuid].claim(pid)
-            logger.debug("Device %s claimed by user %s", uuid, user)
+            logger.debug("Device %s claimed by user %s", uuid, user['email'])
             return True
         return False
 
@@ -291,8 +291,9 @@ def run():
         from patroller.gpu import GPUMonitor
 
         user_labels = None if not "PATROLLER_USER_LABELS" in os.environ else os.environ["PATROLLER_USER_LABELS"].split(",")
+        user_info_labels = None if not "PATROLLER_USER_INFO_LABELS" in os.environ else os.environ["PATROLLER_USER_INFO_LABELS"].split(",")
 
-        resolver = DockerIdentityResolver(user_labels)
+        resolver = DockerIdentityResolver(user_labels, user_info_labels)
         monitors = [GPUMonitor()]
 
     lease_time = 10 if not "PATROLLER_LEASE" in os.environ else int(os.environ["PATROLLER_LEASE"])

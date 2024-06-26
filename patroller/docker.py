@@ -18,7 +18,7 @@ def pid_to_container(pid):
 
 class DockerIdentityResolver(IdentityResolver):
 
-    def __init__(self, user_labels=None):
+    def __init__(self, user_labels=None, user_info_lables=None):
         super().__init__()
         self._cache = {}
         self._docker = docker.from_env()
@@ -26,6 +26,8 @@ class DockerIdentityResolver(IdentityResolver):
             self._labels = ["user.email", "email", "maintainer"]
         else:
             self._labels = user_labels
+
+        self.user_info_lables = user_info_lables
 
     def identify_process(self, pid):
 
@@ -43,12 +45,20 @@ class DockerIdentityResolver(IdentityResolver):
             ct = self._docker.containers.get(container)
             labels = ct.labels
 
+            user_id = dict()
+
             for name in self._labels:
                 if name in labels:
                     name, address = parseaddr(labels[name])
                     if address:
-                        self._cache[container] = address
+                        user_id = dict(email=address)
                     break
+            
+            if self.user_info_lables is not None:                
+                user_id.update({name: labels[name] for name in self.user_info_lables if name in labels})                
+
+            if len(user_id) > 0:
+                self._cache[container] = user_id
 
         except docker.errors.NotFound:
             return None
