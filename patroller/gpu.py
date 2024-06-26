@@ -8,6 +8,7 @@ from datetime import datetime
 import json
 
 from blinker import signal
+from collections import OrderedDict
 
 from patroller.base import Device, DeviceMonitor
 
@@ -15,7 +16,7 @@ SMI_BINARY = "nvidia-smi"
 
 class GPU(Device):
 
-    ATTRIBUTES = ["name", "brand", "number"]
+    ATTRIBUTES = ["name", "brand", "arch", "number", "pci_address", "total_mem"]
 
     STATS = ["power", "gtemp", "mtemp", "sm", "mem", "enc", "dec", "mclk", "pclk"]
 
@@ -141,13 +142,19 @@ class GPUMonitor(DeviceMonitor):
     def __init__(self):
         response = subprocess.check_output([SMI_BINARY, "-q", "-x"])
         doc = ET.parse(io.StringIO(response.decode("utf-8")))
-        self._gpus = dict()
+        self._gpus = OrderedDict()
         for gpu in doc.getroot().iter("gpu"):
             name = gpu.find("product_name").text
             brand = gpu.find("product_brand").text
+            arch = gpu.find("product_architecture").text
             uuid = gpu.find("uuid").text
+            pci_address = gpu.get("id")
             number = int(gpu.find("minor_number").text)
-            self._gpus[number] = GPU(uuid, name=name, brand=brand, number=number)
+            fb_memory_usage = gpu.find("fb_memory_usage")
+            if fb_memory_usage is not None:
+                total_mem = fb_memory_usage.find("total").text
+        
+            self._gpus[number] = GPU(uuid, name=name, brand=brand, arch=arch, number=number, pci_address=pci_address, total_mem=total_mem)
 
         self._dmon = DMon(self)
         self._pmon = PMon(self)

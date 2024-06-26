@@ -14,6 +14,7 @@ from tornado.ioloop import IOLoop
 import tornado.web
 
 from cachetools import TTLCache, cached
+from collections import OrderedDict
 
 logger = logging.getLogger("patroller")
 
@@ -71,7 +72,7 @@ class Node(object):
         super().__init__()
         self._lease = lease
         self._resolver = resolver
-        self._devices = dict()
+        self._devices = OrderedDict()
         self._pending = []
         signal("access").connect(self._handle_access_signal)
         for monitor in monitors:
