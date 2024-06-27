@@ -60,6 +60,7 @@ class Node(object):
         def claim(self, pid=None):
             if pid is None:
                 if len(self._processes) > 0:
+                    self._unclaimed = True
                     self._processes = []
                     self._update = datetime.now()
             elif pid not in self._processes:
