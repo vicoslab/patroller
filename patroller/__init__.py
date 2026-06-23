@@ -29,15 +29,29 @@ class Node(object):
     class Claim(object):
 
         def __init__(self, user=None):
-            self._user = user
+            self._users = OrderedDict()
             self._since = datetime.now()
             self._update = datetime.now()
-            self._processes = []
+            self._processes = OrderedDict()
             self._unclaimed = True
+            if user is not None:
+                self.add_user(user)
+
+        @staticmethod
+        def _user_key(user):
+            if isinstance(user, dict) and "email" in user:
+                return user["email"]
+            return json.dumps(user, sort_keys=True)
 
         @property
         def user(self):
-            return self._user
+            for user in self._users.values():
+                return user
+            return None
+
+        @property
+        def users(self):
+            return list(self._users.values())
 
         @property
         def age(self):
@@ -49,7 +63,7 @@ class Node(object):
 
         @property
         def processes(self):
-            return list(self._processes)
+            return [pid for processes in self._processes.values() for pid in processes]
 
         @property
         def reservation(self):
@@ -57,17 +71,31 @@ class Node(object):
 
         @property
         def free(self):
-            return self._user is None
+            return len(self._users) == 0
 
-        def claim(self, pid=None):
+        def has_user(self, user):
+            return self._user_key(user) in self._users
+
+        def add_user(self, user):
+            key = self._user_key(user)
+            if key not in self._users:
+                self._users[key] = user
+                self._processes[key] = []
+            return key
+
+        def claim(self, user=None, pid=None):
             if pid is None:
-                if len(self._processes) > 0:
+                if len(self.processes) > 0:
                     self._unclaimed = True
-                    self._processes = []
+                    for key in self._processes:
+                        self._processes[key] = []
                     self._update = datetime.now()
-            elif pid not in self._processes:
+                return
+
+            key = self.add_user(user)
+            if pid not in self._processes[key]:
                 self._unclaimed = False
-                self._processes.append(pid)
+                self._processes[key].append(pid)
                 self._update = datetime.now()
 
 
@@ -99,7 +127,7 @@ class Node(object):
             return
 
         if process is None:
-            self._claims[device].claim()
+            self._claims[device].claim(pid=None)
 
         else:
 
@@ -175,20 +203,22 @@ class Node(object):
         return {self._devices[uuid] for uuid in devices}
 
     def claim(self, uuid, user, pid=None):
-        if user == self._claims[uuid].user:
-            self._claims[uuid].claim(pid)
+        if self._claims[uuid].has_user(user):
+            self._claims[uuid].claim(user, pid)
             return True
         if self._claims[uuid].free:
             self._claims[uuid] = Node.Claim(user)
             if pid is not None:
-                self._claims[uuid].claim(pid)
+                self._claims[uuid].claim(user, pid)
             logger.debug("Device %s claimed by user %s", uuid, user['email'])
             return True
+        if pid is not None:
+            self._claims[uuid].claim(user, pid)
         return False
 
     def status(self, uuid):
         claim = self._claims[uuid]
-        return dict(user=claim.user, age=claim.age, processes=claim.processes)
+        return dict(user=claim.user, users=claim.users, age=claim.age, processes=claim.processes)
 
     def resolve(self, token):
         return self._resolver(token)
@@ -320,4 +350,3 @@ def run():
         pass
     for monitor in monitors:
         monitor.stop()
-
