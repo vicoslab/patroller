@@ -20,6 +20,8 @@ logger = logging.getLogger("patroller")
 
 from patroller.base import IdentityResolver, TestDeviceMonitor
 
+UNKNOWN_USER = {"email": "N/A", "name": "Unknown"}
+
 loop = IOLoop.instance()
 
 class Node(object):
@@ -104,10 +106,10 @@ class Node(object):
             user = self._resolver(process)
 
             if user is None:
-                logger.warning("Unable to identify user for process %d", process)
-            else:
-                if not self.claim(device, user, process):
-                    logger.warning("Trespassing process %d on device %s detected.", process, device)
+                user = UNKNOWN_USER
+
+            if not self.claim(device, user, process):
+                logger.warning("Trespassing process %d on device %s detected.", process, device)
 
     def _cleanup(self):
         change = False
