@@ -10,7 +10,7 @@ It is designed for research servers where many users launch Docker containers on
 - Detects GPU-using processes with `nvidia-smi pmon`.
 - Resolves Docker containers from cgroup v1, cgroup v2, and systemd scope paths.
 - Associates usage with users through configurable Docker labels.
-- Exposes JSON endpoints for device inventory, live status, immediate reservations, and blocking reservations.
+- Exposes JSON endpoints for device inventory, live status, immediate claims, blocking claims, and email-assigned time-limited reservations.
 - Provides a small Python helper for clients that sets `CUDA_VISIBLE_DEVICES` after a successful claim.
 - Includes a test mode with synthetic devices for local API development.
 
@@ -90,7 +90,8 @@ Patroller is configured with environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PATROLLER_TEST` | unset | Enables synthetic test devices instead of Docker/GPU monitoring. |
-| `PATROLLER_LEASE` | `10` | Number of seconds a reservation may remain unclaimed before it is released. |
+| `PATROLLER_LEASE` | `10` | Number of seconds a claim may remain unclaimed before it is released. |
+| `PATROLLER_RESERVATIONS_FILE` | `/var/lib/patroller/reservations.json` | JSON file used to persist time-limited reservations across Patroller restarts or host reboots. |
 | `PATROLLER_USER_LABELS` | `user.email,email,maintainer` | Comma-separated Docker labels searched for a user email address. |
 | `PATROLLER_USER_INFO_LABELS` | unset | Extra comma-separated Docker labels copied into the returned user identity. |
 
@@ -134,6 +135,41 @@ Returns live statistics and claim state for each device.
 
 ```bash
 curl http://localhost/status
+```
+
+### Reservations
+
+Reservations assign a specific device to a specific user email until an expiration time. Reservations are persisted to `PATROLLER_RESERVATIONS_FILE` so they survive Patroller restarts and host reboots. Expired reservations are automatically removed from `/status`, removed from the persisted file, and no longer block claims. If another user is already running on a reserved GPU, Patroller records the usage and logs a conflict, but it does not stop the process yet; the conflict hook is isolated so automatic notification/removal can be added later.
+
+Create a reservation with either an ISO-8601 expiration:
+
+```bash
+curl -X POST http://localhost/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"GPU-...","email":"alice@example.org","expires_at":"2026-06-23T18:00:00Z"}'
+```
+
+or a short TTL in seconds:
+
+```bash
+curl -X POST http://localhost/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"device":"GPU-...","email":"alice@example.org","ttl":3600}'
+```
+
+List active reservations:
+
+```bash
+curl http://localhost/reservations
+```
+
+Modify or remove a reservation:
+
+```bash
+curl -X PATCH http://localhost/reservations/GPU-... \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"bob@example.org","expires_at":"2026-06-23T19:00:00Z"}'
+curl -X DELETE http://localhost/reservations/GPU-...
 ```
 
 ### `GET /request?<resource>=<count>`
