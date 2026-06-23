@@ -1,26 +1,65 @@
 
 from email.utils import parseaddr
+import re
 
-import docker
 from cachetools import TTLCache, cached
 
 from patroller.base import IdentityResolver
 
+CONTAINER_ID_RE = re.compile(r"(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])")
+DOCKER_SCOPE_RE = re.compile(r"docker-([0-9a-f]{64})\.scope")
+
+
+def container_id_from_cgroup_path(path):
+    """Extract a Docker container id from a cgroup path.
+
+    Docker's cgroup path depends on the host init system, Docker cgroup driver,
+    and cgroup version.  Older Ubuntu hosts commonly expose paths like
+    ``/docker/<id>`` while newer systemd/cgroup-v2 hosts expose paths like
+    ``/system.slice/docker-<id>.scope``.  Docker can also be nested under
+    systemd slices or other cgroup parents, so scan the whole path instead of
+    relying on a specific controller such as cpuset.
+    """
+
+    match = DOCKER_SCOPE_RE.search(path)
+    if match is not None:
+        return match.group(1)
+
+    match = CONTAINER_ID_RE.search(path)
+    if match is not None:
+        return match.group(1)
+
+    return None
+
+
 def pid_to_container(pid):
-    container = None
     with open("/proc/%d/cgroup" % pid) as fp:
-        for line in fp:
-            line = line.strip()
-            _, subsys, name = line.split(':', 2)
-            if subsys == "cpuset" and name.startswith("/docker/"):
-                container = name[8:]
-    return container
+        return cgroup_to_container(fp)
+
+
+def cgroup_to_container(lines):
+    for line in lines:
+        line = line.strip()
+        try:
+            _, _, name = line.split(':', 2)
+        except ValueError:
+            continue
+
+        container = container_id_from_cgroup_path(name)
+        if container is not None:
+            return container
+
+    return None
+
 
 class DockerIdentityResolver(IdentityResolver):
 
     def __init__(self, user_labels=None, user_info_lables=None):
         super().__init__()
+        import docker
+
         self._cache = {}
+        self._docker_errors = docker.errors
         self._docker = docker.from_env()
         if user_labels is None:
             self._labels = ["user.email", "email", "maintainer"]
@@ -60,7 +99,7 @@ class DockerIdentityResolver(IdentityResolver):
             if len(user_id) > 0:
                 self._cache[container] = user_id
 
-        except docker.errors.NotFound:
+        except self._docker_errors.NotFound:
             return None
 
         if container in self._cache:
