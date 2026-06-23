@@ -4,8 +4,6 @@ Patroller keeps order on shared, multi-user, multi-GPU machines by tracking GPU 
 
 It is designed for research servers where many users launch Docker containers on the same NVIDIA GPU host. Patroller watches GPU activity through `nvidia-smi`, identifies Docker containers from Linux cgroup metadata, reads user identity from container labels, and hands out short-lived device reservations to clients.
 
-> **Status:** Alpha / work in progress. Use carefully on production systems and review the security notes before exposing the service on a network.
-
 ## Features
 
 - Monitors NVIDIA GPU statistics with `nvidia-smi dmon`.
