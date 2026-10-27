@@ -1,8 +1,7 @@
 #!/usr/bin/env python
 
 from os.path import join, dirname, abspath, isfile
-from distutils.core import setup
-from setuptools import find_packages
+from setuptools import setup, find_packages
 
 this_directory = abspath(dirname(__file__))
 with open(join(this_directory, 'README.md'), encoding='utf-8') as f:
@@ -14,7 +13,7 @@ if isfile(join(this_directory, "requirements.txt")):
         install_requires = f.readlines()
 
 setup(name='patroller',
-    version=__version__,
+    version="0.1.0",
     description='Keeping order on multi-user multi-GPU machines',
     long_description=long_description,
     long_description_content_type='text/markdown',
@@ -31,7 +30,7 @@ setup(name='patroller',
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
     ],
-    python_requires='>=3.6',
+    python_requires='>=3.8',
     entry_points={
         'console_scripts': ['patroller=patroller:main'],
     },

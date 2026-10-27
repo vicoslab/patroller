@@ -1,5 +1,4 @@
 
-import uuid
 
 class Device(object):
 
@@ -44,8 +43,9 @@ class TestDeviceMonitor(DeviceMonitor):
 
     def __init__(self, count):
         self._devices = []
-        for _ in range(count):
-            self._devices.append(Device("TEST-" + str(uuid.uuid4()), "test"))
+        for index in range(count):
+            # Stable synthetic IDs make local calendar persistence meaningful.
+            self._devices.append(Device("TEST-%d" % index, "test"))
 
     def __iter__(self):
         return iter(self._devices)

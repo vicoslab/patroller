@@ -58,7 +58,6 @@ class DockerIdentityResolver(IdentityResolver):
         super().__init__()
         import docker
 
-        self._cache = {}
         self._docker_errors = docker.errors
         self._docker = docker.from_env()
         if user_labels is None:
@@ -96,14 +95,12 @@ class DockerIdentityResolver(IdentityResolver):
             if self.user_info_lables is not None:                
                 user_id.update({name: labels[name] for name in self.user_info_lables if name in labels})                
 
-            if len(user_id) > 0:
-                self._cache[container] = user_id
+            # Never reuse stale labels in the destructive enforcement path.
+            return user_id if user_id.get("email") else None
 
         except self._docker_errors.NotFound:
             return None
 
-        if container in self._cache:
-            return self._cache[container]
 
     def identify_client(self, address):
         container = self._find_container(address)
