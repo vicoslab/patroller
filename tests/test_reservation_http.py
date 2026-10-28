@@ -42,6 +42,66 @@ class APIScenarios:
                               headers=headers or {})
         return response.code, json.loads(response.body)
 
+    def test_recurring_crud_actual_status_gaps_and_rollback(self):
+        auth = {"Authorization": "Bearer secret"}
+        rule = dict(frequency="daily", until="2030-01-03", timezone="UTC")
+        payload = record(["GPU-a", "GPU-b"], recurrence=rule)
+        assert self.call("/reserve", "POST", payload)[0] == 401
+        code, series = self.call("/reserve", "POST", payload, auth)
+        assert code == 201 and len(series["occurrences"]) == 3
+        assert self.call("/reservations") == (200, [series])
+        self.node._clock = lambda: datetime(2030, 1, 2, 0, 30, tzinfo=timezone.utc)
+        status = self.call("/status")[1]["GPU-a"]
+        assert status["active_reservation"]["id"] == series["id"]
+        assert status["active_reservation"]["start_at"] == "2030-01-02T00:00:00Z"
+        assert status["next_reservation"]["start_at"] == "2030-01-03T00:00:00Z"
+        assert "occurrences" not in status["active_reservation"]
+        assert "occurrences" not in status["next_reservation"]
+        self.node._clock = lambda: datetime(2030, 1, 2, 1, tzinfo=timezone.utc)
+        status = self.call("/status")[1]["GPU-a"]
+        assert status["active_reservation"] is None
+        assert status["next_reservation"]["start_at"] == "2030-01-03T00:00:00Z"
+        assert self.call("/request?gpu=2")[0] == 200
+        gap = record(start_at="2030-01-02T02:00:00Z", end_at="2030-01-02T03:00:00Z")
+        code, gap_booking = self.call("/reserve", "POST", gap, auth)
+        assert code == 201
+        edit = dict(payload, start_at="2030-01-01T02:00:00Z", end_at="2030-01-01T03:00:00Z")
+        assert self.call("/reservations/" + series["id"], "PATCH", edit, auth)[0] == 409
+        assert series in self.call("/reservations")[1]
+        edit = dict(payload, note="whole series", recurrence=dict(rule, until="2030-01-04"))
+        code, updated = self.call("/reservations/" + series["id"], "PATCH", edit, auth)
+        assert code == 200 and updated["id"] == series["id"] and len(updated["occurrences"]) == 4
+        assert self.call("/reserve", "POST", dict(payload, occurrences=[]), auth)[0] == 400
+        assert self.call("/reserve", "POST", dict(payload, recurrence=dict(rule, until=True)), auth)[0] == 400
+        assert self.call("/unreserve", "POST", {"id": series["id"]}, auth) == (200, {"id": series["id"], "cancelled": True})
+        assert self.call("/reservations") == (200, [gap_booking])
+        assert self.call("/status")[1]["GPU-b"]["next_reservation"] is None
+
+    def test_invalid_timezone_returns_400_without_writing(self):
+        auth = {"Authorization": "Bearer secret"}
+        for zone in ("x" * 256, "A/" + "x" * 256, "UTC/../UTC"):
+            payload = record(recurrence=dict(frequency="daily", until="2030-01-03", timezone=zone))
+            code, error = self.call("/reserve", "POST", payload, auth)
+            assert code == 400 and "error" in error
+            assert self.cal.list() == []
+
+    def test_corrupt_series_blocks_http_availability_and_protection(self):
+        import sqlite3
+        series = self.cal.create(record(recurrence=dict(
+            frequency="daily", until="2030-01-03", timezone="UTC")))
+        series["occurrences"] = []
+        with sqlite3.connect(self.cal.path) as db:
+            db.execute("UPDATE reservations SET record=?", (json.dumps(series),))
+        self.node._clock = lambda: datetime(2030, 1, 2, 0, 30, tzinfo=timezone.utc)
+        assert self.call("/reservations")[0] == 503
+        assert self.call("/request?gpu=2")[0] == 503
+        code, status = self.call("/status")
+        assert code == 200
+        assert status["GPU-a"]["reservation_state"] == "unavailable"
+        assert status["GPU-b"]["reservation_state"] == "unavailable"
+        payload = record(start_at="2030-01-02T00:30:00Z", end_at="2030-01-02T01:30:00Z")
+        assert self.call("/reserve", "POST", payload, {"Authorization": "Bearer secret"})[0] == 503
+
     def test_crud_auth_status_and_legacy_filter(self):
         assert self.call("/reservations") == (200, [])
         assert self.call("/reserve", "POST", record())[0] == 401

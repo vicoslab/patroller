@@ -203,7 +203,13 @@ Avoid exposing tokens in shell history, logs or browser-visible configuration.
 | `PATCH /reservations/<id>` | all editable fields | 200, updated record retaining id |
 | `POST /unreserve` | `{"id":"..."}` | 200, `{"id":"...","cancelled":true}` |
 
-Editable fields are `gpu_uuids`, `owner_email`, `start_at`, `end_at`, and `note`.
+Required editable fields are `gpu_uuids`, `owner_email`, `start_at`, `end_at`, and
+`note`. The optional `recurrence` field adds a bounded series (see below).
+The optional `owner_name` is display metadata: it is trimmed, limited to 200
+characters, and must contain no ASCII control characters (including DEL). An
+omitted or blank name is omitted from the record; a full PATCH clears an existing
+name when omitted or blank. Names never affect permissions or enforcement, which
+continue to use `owner_email`.
 Submit opaque UUIDs from `/devices`, never GPU indices. Email addresses are trimmed
 and compared case-insensitively. Use ISO8601 timestamps with seconds and an explicit
 offset (`Z` or `+HH:MM`), with up to six fractional digits; responses use UTC `Z`.
@@ -225,6 +231,101 @@ curl -X POST http://127.0.0.1:8080/reserve \
 # Edit by PATCHing the full editable object to /reservations/<returned-id>.
 # Cancel with POST /unreserve and {"id":"<returned-id>"} using the same credential.
 ```
+
+### Bounded recurring reservations
+
+`POST /reserve` and `PATCH /reservations/<id>` accept an optional `recurrence`
+object. Omitting it or sending `null` creates a one-off with exactly the existing
+record shape: no `recurrence` or `occurrences` fields are added. The backend still
+requires `start_at` and `end_at`; clients offering start plus duration should
+compute `end_at` by adding the duration to the UTC start. There is no API
+`duration` field.
+
+| Rule field | Required value |
+| --- | --- |
+| `frequency` | `daily`, `weekly`, `biweekly`, or `monthly` |
+| `until` | Strict `YYYY-MM-DD`; inclusive local start-date limit, from the initial local date through 366 days later |
+| `timezone` | Explicit valid IANA timezone name, for example `Europe/Ljubljana` or `UTC` |
+| `weekdays` | Required only for `weekly`/`biweekly`: nonempty unique integer list, Monday=0 through Sunday=6, including the initial local weekday |
+
+Unknown fields are rejected, including `weekdays` on daily/monthly rules. Boolean
+and fractional weekday values are rejected. Returned weekdays are sorted.
+Biweekly schedules use the Monday of the initial start's week as their anchor,
+then repeat in every other week. Monthly schedules retain the original
+day-of-month and skip months without it; January 31 never becomes February 28.
+`until` limits occurrence starts; an occurrence may end after that date.
+
+The explicit-offset input start identifies an instant. Converting it to the named
+timezone establishes the local start date and clock; UTC inputs are supported.
+Every occurrence retains that clock and the original **elapsed** duration
+`end_utc - start_utc`. Ends are calculated in UTC, so a two-hour booking lasts two
+actual hours across DST. If any recurrence start (including the initial one) is
+ambiguous or nonexistent in its timezone, the entire request returns 400; starts
+are never silently shifted. An end may land on a repeated clock hour. Deployments
+need IANA timezone data; Python 3.8 installs `backports.zoneinfo` conditionally,
+and Python 3.9+ uses the standard library.
+
+For example, this creates two daily two-hour bookings across spring DST:
+
+```json
+{
+  "gpu_uuids": ["TEST-0"],
+  "owner_email": "alice@example.org",
+  "start_at": "2030-03-30T09:00:00+01:00",
+  "end_at": "2030-03-30T11:00:00+01:00",
+  "note": "daily experiment",
+  "recurrence": {
+    "frequency": "daily",
+    "until": "2030-03-31",
+    "timezone": "Europe/Ljubljana"
+  }
+}
+```
+
+The create response (201), update response (200), and list records include one
+series ID, the UTC template times, the normalized rule, and read-only windows:
+
+```json
+{
+  "id": "<series-id>",
+  "gpu_uuids": ["TEST-0"],
+  "owner_email": "alice@example.org",
+  "start_at": "2030-03-30T08:00:00Z",
+  "end_at": "2030-03-30T10:00:00Z",
+  "note": "daily experiment",
+  "recurrence": {
+    "frequency": "daily",
+    "until": "2030-03-31",
+    "timezone": "Europe/Ljubljana"
+  },
+  "occurrences": [
+    {"start_at": "2030-03-30T08:00:00Z", "end_at": "2030-03-30T10:00:00Z"},
+    {"start_at": "2030-03-31T07:00:00Z", "end_at": "2030-03-31T09:00:00Z"}
+  ]
+}
+```
+
+All windows are deterministic, sorted, and bounded to at most 367 occurrences.
+The whole series is validated before writing: invalid rules, date ranges, DST
+starts or self-overlap return 400; overlap with another booking on any selected
+GPU returns 409. Touching windows are allowed. Conflict checks compare actual
+windows, so free gaps between occurrences remain bookable. A later-occurrence
+conflict rejects the entire multi-GPU create/edit and preserves existing records.
+
+PATCH replaces the **entire series** while retaining its ID, owner/GPU/note fields
+as supplied by the full editable payload. Omit `id` and `occurrences` from writes;
+they are read-only. Omitting/nulling `recurrence` on PATCH converts the booking to
+a one-off. `POST /unreserve` cancels all occurrences for that ID. Individual
+occurrence edits, exceptions and unbounded schedules are unsupported.
+
+The existing SQLite table stores recurring rules and windows in its JSON record;
+the indexed start/end columns cover the full series envelope. Existing one-off
+rows need no migration and are not rewritten. Restart uses the stored windows.
+`Calendar.active_next` and `/status` return the actual active/next occurrence's
+top-level `start_at`/`end_at`, retaining the series ID, owner, GPUs, note and rule
+but omitting `occurrences`. This includes second/later windows and returns no
+active booking in gaps or after the last end. Allocation and enforcement use
+that same lookup; recurrence adds no scheduler or process signaling path.
 
 `/status` retains the existing UUID-keyed response, GPU stats and `claim`, adding
 `active_reservation`, `next_reservation`, `reservation_state` (`enabled`, `disabled`,
@@ -301,7 +402,10 @@ python -m pytest
 
 Tests cover calendar validation, concurrent/atomic writes, persistence, HTTP/auth,
 status, legacy allocation filtering, configuration and process enforcement, plus
-existing cgroup/claim behavior. Tests block non-loopback networking, Unix/Docker
+existing cgroup/claim behavior. Recurrence tests cover all four frequencies,
+weekday subsets, month skipping, bounds/types, DST, actual-window conflicts and
+gaps, later-window status/enforcement, whole-series rollback/cancellation and old
+DB compatibility. Tests block non-loopback networking, Unix/Docker
 socket connections, arbitrary subprocesses and signals to unowned PIDs. The only
 real termination test spawns and tracks its own sleeping Python child with a fake
 resolver/inspector. No GPU or Docker daemon is needed. On sandboxes forbidding
@@ -312,7 +416,7 @@ integration demo should run the loopback tests where sockets are permitted.
 In the shared development workspace the configured interpreter is:
 
 ```bash
-PYTHONPATH=. ../.venv/bin/python -m pytest -q --basetemp=/tmp/patroller-backend-tests
+PYTHONPATH=. ../.venv/bin/python -m pytest -q --basetemp="$(mktemp -d /tmp/patroller-backend-tests-XXXXXX)"
 ```
 
 ## Security notes

@@ -198,6 +198,40 @@ def test_workload_running_before_window_is_enforced_at_start(tmp_path):
     assert len(guard.sent) == 1
 
 
+def test_recurring_enforcement_uses_later_windows_and_stops_in_gaps(tmp_path):
+    node, cal, booking, resolver, guard, now = fixture(tmp_path)
+    cal.update(booking["id"], record(recurrence=dict(frequency="daily", until="2030-01-03", timezone="UTC")))
+    now[0] = NOW + timedelta(days=1)
+    node._handle_access("GPU-a", 101)
+    assert guard.sent == [(101, 42)]
+    now[0] += timedelta(hours=1)
+    node._handle_access("GPU-a", 101)
+    assert len(guard.sent) == 1
+    node._claims = {key: Node.Claim(clock=node._clock) for key in node._claims}
+    assert len(node.reserve({"email": "bob@example.org"}, {"gpu": 2})) == 2
+    now[0] = NOW + timedelta(days=2)
+    node._handle_access("GPU-a", 101)
+    assert len(guard.sent) == 2
+    resolver.user = {"email": "alice@example.org"}
+    node._handle_access("GPU-a", 101)
+    assert len(guard.sent) == 2
+    cal.cancel(booking["id"])
+    resolver.user = {"email": "bob@example.org"}
+    node._handle_access("GPU-a", 101)
+    assert len(guard.sent) == 2
+
+
+def test_recurring_queued_event_revalidates_current_window(tmp_path, monkeypatch):
+    guard = ObservedGuard()
+    node, cal, booking, _, _, now = fixture(tmp_path, guard=guard)
+    cal.update(booking["id"], record(recurrence=dict(frequency="daily", until="2030-01-03", timezone="UTC")))
+    now[0] = NOW + timedelta(days=1)
+    queued = queue_access(node, monkeypatch)
+    now[0] += timedelta(hours=1)
+    drain_access(queued)
+    assert not guard.sent
+
+
 def test_final_owner_change_or_resolution_error_skips(tmp_path):
     node, _, _, resolver, guard, _ = fixture(tmp_path)
     calls = [0]
