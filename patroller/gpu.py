@@ -142,6 +142,21 @@ class GPUMonitor(DeviceMonitor):
     def __init__(self):
         response = subprocess.check_output([SMI_BINARY, "-q", "-x"])
         doc = ET.parse(io.StringIO(response.decode("utf-8")))
+        # pmon/dmon report NVIDIA indices, not Linux device minor numbers.
+        # These differ on real hosts and inside restricted GPU containers.
+        index_response = subprocess.check_output([SMI_BINARY, "--query-gpu=index,uuid", "--format=csv,noheader,nounits"])
+        index_by_uuid = {}
+        for line in index_response.decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            index, gpu_uuid = (value.strip() for value in line.split(","))
+            number = int(index)
+            if number < 0 or gpu_uuid in index_by_uuid or number in index_by_uuid.values():
+                raise ValueError("Invalid or duplicate NVIDIA GPU index mapping")
+            index_by_uuid[gpu_uuid] = number
+        xml_uuids = [gpu.find("uuid").text for gpu in doc.getroot().iter("gpu")]
+        if len(xml_uuids) != len(set(xml_uuids)) or set(xml_uuids) != set(index_by_uuid):
+            raise ValueError("Inconsistent NVIDIA GPU UUID/index metadata")
         self._gpus = OrderedDict()
         for gpu in doc.getroot().iter("gpu"):
             name = gpu.find("product_name").text
@@ -149,7 +164,7 @@ class GPUMonitor(DeviceMonitor):
             arch = gpu.find("product_architecture").text
             uuid = gpu.find("uuid").text
             pci_address = gpu.get("id")
-            number = int(gpu.find("minor_number").text)
+            number = index_by_uuid[uuid]
             fb_memory_usage = gpu.find("fb_memory_usage")
             if fb_memory_usage is not None:
                 total_mem = fb_memory_usage.find("total").text
