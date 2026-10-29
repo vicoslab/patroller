@@ -61,7 +61,7 @@ def test_same_pid_owner_transfer_removes_empty_old_owner_after_repeated_observat
         assert status["user"] == bob
         assert status["users"] == [bob]
         assert status["processes"] == [101]
-    assert list(node._claims["GPU-0"]._processes) == ["bob@example.org"]
+    assert list(node._claims["GPU-0"]._processes) == [("email", "bob@example.org")]
 
 
 def test_owner_transfer_preserves_old_owners_other_pids_and_legacy_lease():

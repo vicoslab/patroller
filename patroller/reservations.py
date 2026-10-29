@@ -43,6 +43,40 @@ def email(value):
     return value if len(local) <= 64 and not local.startswith(".") and not local.endswith(".") and ".." not in local else None
 
 
+def identity_name(value):
+    """A case-sensitive trusted container name, never a placeholder identity."""
+    if not isinstance(value, str) or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return None
+    value = value.strip()
+    if not 1 <= len(value) <= 200 or value.casefold() in {"unknown", "unknown user", "n/a", "none", "null"}:
+        return None
+    return value
+
+
+def process_identity(user):
+    """Email always wins over container-name metadata when it is usable."""
+    if not isinstance(user, dict):
+        return None
+    owner = email(user.get("email"))
+    if owner is not None:
+        return "email", owner
+    name = identity_name(user.get("ccc-user.name")) or identity_name(user.get("name"))
+    return ("name", name) if name is not None else None
+
+
+def reservation_identity(record):
+    """Bookings opt into name authorization explicitly; email names are display only."""
+    if not isinstance(record, dict):
+        return None
+    if "owner_type" in record:
+        if record["owner_type"] != "name" or record.get("owner_email") != "":
+            return None
+        name = identity_name(record.get("owner_name"))
+        return ("name", name) if name is not None else None
+    owner = email(record.get("owner_email"))
+    return ("email", owner) if owner is not None else None
+
+
 def parse_time(value):
     if not isinstance(value, str) or not ISO_TIME.fullmatch(value):
         raise ReservationError(400, "Timestamps require ISO8601 date/time and an explicit offset")
@@ -200,16 +234,17 @@ class Calendar:
 
     def _validate(self, value):
         fields = {"gpu_uuids", "owner_email", "start_at", "end_at", "note"}
-        if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"recurrence", "owner_name"}:
-            raise ReservationError(400, "Expected gpu_uuids, owner_email, start_at, end_at, note and optional recurrence or owner_name")
+        if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"recurrence", "owner_name", "owner_type"}:
+            raise ReservationError(400, "Expected gpu_uuids, owner_email, start_at, end_at, note and optional recurrence, owner_name or owner_type")
         gpus = value["gpu_uuids"]
         if (not isinstance(gpus, list) or not gpus or
                 any(not isinstance(gpu, str) or gpu not in self.gpu_uuids for gpu in gpus) or
                 len(set(gpus)) != len(gpus)):
             raise ReservationError(400, "GPU UUIDs must be a nonempty list of unique known GPUs")
-        owner = email(value["owner_email"])
-        if owner is None:
-            raise ReservationError(400, "Invalid owner email")
+        identity = reservation_identity(value)
+        if identity is None:
+            raise ReservationError(400, "Invalid reservation owner identity")
+        owner = identity[1] if identity[0] == "email" else ""
         note = value["note"]
         if not isinstance(note, str) or len(note) > MAX_NOTE:
             raise ReservationError(400, "Note must be a string of at most 4096 characters")
@@ -218,6 +253,8 @@ class Calendar:
             raise ReservationError(400, "end_at must be after start_at")
         record = dict(gpu_uuids=gpus, owner_email=owner, start_at=utc_string(start),
                       end_at=utc_string(end), note=note)
+        if identity[0] == "name":
+            record.update(owner_type="name", owner_name=identity[1])
         if "owner_name" in value:
             name = value["owner_name"]
             if (not isinstance(name, str) or any(ord(char) < 32 or ord(char) == 127 for char in name)):
@@ -279,7 +316,8 @@ class Calendar:
             if not isinstance(record, dict):
                 raise ValueError("Invalid stored record")
             series = "recurrence" in record
-            if set(record) != fields | ({"recurrence", "occurrences"} if series else set()) | ({"owner_name"} if "owner_name" in record else set()):
+            optional = {key for key in ("owner_name", "owner_type") if key in record}
+            if set(record) != fields | ({"recurrence", "occurrences"} if series else set()) | optional:
                 raise ValueError("Invalid stored fields")
             if (not isinstance(record["id"], str) or not record["id"].strip() or
                     record["id"] != sql_id):
@@ -290,6 +328,8 @@ class Calendar:
                 raise ValueError("Invalid stored series")
             payload = {key: value for key, value in record.items() if key not in {"id", "occurrences"}}
             validated, start, end = self._validate(payload)
+            if record["owner_email"] != validated["owner_email"]:
+                raise ValueError("Invalid stored owner email")
             if "owner_name" in record and record["owner_name"] != validated.get("owner_name"):
                 raise ValueError("Invalid stored owner name")
             if series and (record["recurrence"] != validated["recurrence"] or

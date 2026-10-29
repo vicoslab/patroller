@@ -86,17 +86,19 @@ class DockerIdentityResolver(IdentityResolver):
             user_id = dict()
 
             for name in self._labels:
-                if name in labels:
+                if isinstance(labels.get(name), str):
                     name, address = parseaddr(labels[name])
                     if address:
                         user_id = dict(email=address)
                     break
             
-            if self.user_info_lables is not None:                
-                user_id.update({name: labels[name] for name in self.user_info_lables if name in labels})                
+            # Container names remain useful identity/display metadata even when
+            # no email label or extra-info configuration exists.
+            info_labels = ["ccc-user.name", "name"] + (self.user_info_lables or [])
+            user_id.update({name: labels[name] for name in info_labels if name in labels})
 
             # Never reuse stale labels in the destructive enforcement path.
-            return user_id if user_id.get("email") else None
+            return user_id or None
 
         except self._docker_errors.NotFound:
             return None

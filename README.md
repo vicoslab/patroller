@@ -205,11 +205,24 @@ Avoid exposing tokens in shell history, logs or browser-visible configuration.
 
 Required editable fields are `gpu_uuids`, `owner_email`, `start_at`, `end_at`, and
 `note`. The optional `recurrence` field adds a bounded series (see below).
-The optional `owner_name` is display metadata: it is trimmed, limited to 200
+For email bookings, optional `owner_name` is display metadata: it is trimmed, limited to 200
 characters, and must contain no ASCII control characters (including DEL). An
 omitted or blank name is omitted from the record; a full PATCH clears an existing
-name when omitted or blank. Names never affect permissions or enforcement, which
-continue to use `owner_email`.
+name when omitted or blank. Email bookings use `owner_email` for enforcement.
+
+Name-only containers can be booked explicitly with `"owner_type":"name"`,
+`"owner_email":""`, and required `"owner_name":"toolbox-nanoparticles"`.
+The name must match the trusted `ccc-user.name` label exactly after trimming
+(case sensitive, 1–200 characters, no ASCII controls/DEL). Placeholder names
+`Unknown`, `Unknown user`, `N/A`, `none`, and `null` are rejected case-insensitively.
+Generic `name` is the fallback label when `ccc-user.name` is unusable. A valid
+process email always takes priority: matching name metadata never exempts a
+different email identity from either type of booking. Mixed email/name identities,
+unknown `owner_type`, and explicit `owner_type=email` are rejected with 400.
+Legacy email records omit `owner_type` and are never migrated or rewritten on read.
+Stored identities must be canonical; corrupt records make calendar operations
+unavailable (503). Name identities persist through CRUD, restart and recurrence.
+These labels identify trusted lab containers, not authenticated humans.
 Submit opaque UUIDs from `/devices`, never GPU indices. Email addresses are trimmed
 and compared case-insensitively. Use ISO8601 timestamps with seconds and an explicit
 offset (`Z` or `+HH:MM`), with up to six fractional digits; responses use UTC `Z`.
@@ -336,6 +349,10 @@ Future bookings do not block immediate allocation. Process observations expire
 after five seconds without a refresh; idle events clear processes immediately.
 When a PID changes owner, its obsolete owner entry is removed once that owner
 has no other observed PIDs. Intentional legacy allocation leases remain intact.
+Claims group by typed normalized email or exact container name; unresolved
+metadata uses stable JSON keys. Status preserves nonempty resolved label metadata
+even when it cannot authorize a booking. Docker reads fresh labels for each
+resolution and retains container names without requiring extra-info configuration.
 
 ### Enforcement safety
 

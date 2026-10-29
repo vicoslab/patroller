@@ -17,7 +17,8 @@ from collections import OrderedDict
 logger = logging.getLogger("patroller")
 
 from patroller.base import IdentityResolver, TestDeviceMonitor
-from patroller.reservations import Calendar, ReservationError, ProcessGuard, email, MAX_BODY
+from patroller.reservations import (Calendar, ReservationError, ProcessGuard,
+                                   process_identity, reservation_identity, MAX_BODY)
 
 UNKNOWN_USER = {"email": "N/A", "name": "Unknown"}
 _UNOBSERVED_PROCESS = object()
@@ -40,8 +41,9 @@ class Node(object):
 
         @staticmethod
         def _user_key(user):
-            if isinstance(user, dict) and "email" in user:
-                return user["email"]
+            identity = process_identity(user)
+            if identity is not None:
+                return identity
             return json.dumps(user, sort_keys=True)
 
         @property
@@ -191,7 +193,7 @@ class Node(object):
             except Exception:
                 logger.warning("Unable to resolve observed process; skipping enforcement")
                 user = None
-            if not isinstance(user, dict) or email(user.get("email")) is None:
+            if not isinstance(user, dict) or not user:
                 user = UNKNOWN_USER
 
             # Resolution may itself race with exit/reuse. Do not attribute a
@@ -259,8 +261,9 @@ class Node(object):
                     active = self.calendar.active_next(uuid, self._clock())[0] if self.calendar else None
                 except Exception:
                     raise ReservationError(503, "Calendar storage unavailable") from None
-                owner = email(user.get("email")) if isinstance(user, dict) else None
-                if self._claims[uuid].free and (active is None or active["owner_email"] == owner):
+                owner = process_identity(user)
+                if self._claims[uuid].free and (active is None or
+                        owner is not None and reservation_identity(active) == owner):
                     free.append(uuid)
 
             if len(free) < count:
@@ -316,13 +319,13 @@ class Node(object):
             return
         try:
             active, _ = self.calendar.active_next(device, self._clock())
-            owner = email(user.get("email"))
+            owner = process_identity(user)
             if active is None:
                 return
             if owner is None:
                 logger.info("Skipping reservation enforcement for unknown process %s", pid)
                 return
-            if owner == active["owner_email"]:
+            if owner == reservation_identity(active):
                 return
             if self.enforcement == "dry-run":
                 logger.info("Reservation dry-run: would kill PID %s on %s", pid, device)
@@ -338,13 +341,13 @@ class Node(object):
                 # against edits/cancellation from any service worker.
                 with self.calendar.transaction() as db:
                     fresh_user = self._resolver(pid)
-                    fresh_owner = email(fresh_user.get("email")) if isinstance(fresh_user, dict) else None
+                    fresh_owner = process_identity(fresh_user)
                     if fresh_owner is None or fresh_owner != owner:
                         return
                     if self._guard.inspect(pid) != observed:
                         return
                     current, _ = self.calendar.active_next(device, self._clock(), db)
-                    if current is None or current["id"] != active["id"] or current["owner_email"] == fresh_owner:
+                    if current is None or current["id"] != active["id"] or reservation_identity(current) == fresh_owner:
                         return
                     self._guard.kill(pid, handle)
                     logger.warning("Reservation enforcement killed PID %s on %s", pid, device)
