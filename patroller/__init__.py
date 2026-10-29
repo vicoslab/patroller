@@ -454,22 +454,27 @@ class DeviceRequestHandler(APIHandler):
 
 
 class ReservationAPIHandler(APIHandler):
+    requires_write_token = False
+
     def prepare(self):
         if self.node.calendar is None:
             raise tornado.web.HTTPError(503, reason="Reservation calendar disabled")
-        if self.request.method != "GET":
-            expected = self.settings.get("reservation_token")
-            if not expected:
-                raise tornado.web.HTTPError(403, reason="Reservation writes disabled")
-            supplied = self.request.headers.get("X-Patroller-Reservation-Token")
-            if supplied is None:
-                authorization = self.request.headers.get("Authorization", "")
-                supplied = authorization[7:] if authorization.startswith("Bearer ") else None
-            if not supplied:
-                raise tornado.web.HTTPError(401, reason="Reservation credential required")
-            import hmac
-            if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
-                raise tornado.web.HTTPError(403, reason="Invalid reservation credential")
+        if self.request.method != "GET" or self.requires_write_token:
+            self._require_write_token()
+
+    def _require_write_token(self):
+        expected = self.settings.get("reservation_token")
+        if not expected:
+            raise tornado.web.HTTPError(403, reason="Reservation writes disabled")
+        supplied = self.request.headers.get("X-Patroller-Reservation-Token")
+        if supplied is None:
+            authorization = self.request.headers.get("Authorization", "")
+            supplied = authorization[7:] if authorization.startswith("Bearer ") else None
+        if not supplied:
+            raise tornado.web.HTTPError(401, reason="Reservation credential required")
+        import hmac
+        if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+            raise tornado.web.HTTPError(403, reason="Invalid reservation credential")
 
     def _body(self):
         if len(self.request.body) > MAX_BODY:
@@ -495,6 +500,13 @@ class ReservationAPIHandler(APIHandler):
             logger.error("Calendar operation unavailable")
             self.set_status(503)
             self.finish(json.dumps({"error": "Calendar storage unavailable"}))
+
+class ReservationAccessHandler(ReservationAPIHandler):
+    requires_write_token = True
+
+    def get(self):
+        self.finish(json.dumps({"writable": True}))
+
 
 class ReservationsHandler(ReservationAPIHandler):
     def get(self):
@@ -533,6 +545,7 @@ def make_application(node, reservation_token=None):
         (r"/devices", DevicesHandler, dict(node=node)),
         (r"/request", DeviceRequestHandler, dict(node=node, block=False)),
         (r"/wait", DeviceRequestHandler, dict(node=node, block=True)),
+        (r"/reservation-access", ReservationAccessHandler, dict(node=node)),
         (r"/reservations", ReservationsHandler, dict(node=node)),
         (r"/reserve", ReserveHandler, dict(node=node)),
         (r"/reservations/([^/]+)", ReservationHandler, dict(node=node)),

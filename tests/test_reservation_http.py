@@ -1,6 +1,8 @@
 import json
 import tempfile
 import asyncio
+import hmac
+from pathlib import Path
 from types import SimpleNamespace
 from tornado.httputil import HTTPHeaders, HTTPServerRequest
 from datetime import datetime, timezone
@@ -41,6 +43,91 @@ class APIScenarios:
         response = self.fetch(path, method=method, body=json.dumps(body) if body is not None else None,
                               headers=headers or {})
         return response.code, json.loads(response.body)
+
+    def test_access_requires_credentials_without_changing_public_reads(self):
+        for headers, expected in [({}, 401), ({"Authorization": "Basic abc"}, 401),
+                                  ({"Authorization": "bearer secret"}, 401),
+                                  ({"Authorization": "Bearer wrong-token"}, 403)]:
+            with self.assertLogs("tornado.access", level="WARNING") as logs:
+                code, value = self.call("/reservation-access", headers=headers)
+            assert code == expected
+            assert "error" in value
+            for credential in ("secret", "wrong-token", "Basic abc"):
+                assert credential not in json.dumps(value) + "".join(logs.output)
+        assert self.call("/reservations") == (200, [])
+        assert self.call("/status")[0] == 200
+        assert self.call("/devices")[0] == 200
+
+    def test_access_accepts_write_headers_with_identical_priority(self):
+        for headers, expected in [
+                ({"Authorization": "Bearer secret"}, 200),
+                ({"X-Patroller-Reservation-Token": "secret"}, 200),
+                ({"Authorization": "Basic abc", "X-Patroller-Reservation-Token": "secret"}, 200),
+                ({"Authorization": "Bearer wrong", "X-Patroller-Reservation-Token": "secret"}, 200),
+                ({"Authorization": "Bearer secret", "X-Patroller-Reservation-Token": "wrong"}, 403),
+                ({"Authorization": "Bearer secret", "X-Patroller-Reservation-Token": ""}, 401)]:
+            code, value = self.call("/reservation-access", headers=headers)
+            assert code == expected
+            if code == 200:
+                assert value == {"writable": True}
+            # Verification must use precisely the same precedence as real writes.
+            code, _ = self.call("/unreserve", "POST", {"id": "missing"}, headers)
+            assert code == (404 if expected == 200 else expected)
+
+    def test_access_disabled_and_unconfigured_fail_closed(self):
+        auth = {"Authorization": "Bearer secret"}
+        for configured in (None, "", "secret"):
+            self._app.settings["reservation_token"] = configured
+            self.node.calendar = None
+            for headers in ({}, auth):
+                assert self.call("/reservation-access", headers=headers)[0] == 503
+            self.node.calendar = self.cal
+        for configured in (None, ""):
+            self._app.settings["reservation_token"] = configured
+            for headers in ({}, auth):
+                assert self.call("/reservation-access", headers=headers)[0] == 403
+            assert self.call("/reservations") == (200, [])
+            assert self.call("/status")[0] == 200
+            assert self.call("/devices")[0] == 200
+
+    def test_access_never_opens_calendar_or_mutates_persisted_bookings(self):
+        booking = self.cal.create(record())
+        before = {p.name: p.read_bytes() for p in Path(self.tmp.name).iterdir()}
+        # Even reads currently open a calendar transaction; verification needs none.
+        with patch.object(self.cal, "transaction", side_effect=AssertionError("Calendar accessed")):
+            for _ in range(2):
+                assert self.call("/reservation-access", headers={"Authorization": "Bearer secret"}) == (200, {"writable": True})
+                assert self.call("/reservation-access")[0] == 401
+                assert self.call("/reservation-access", headers={"Authorization": "Bearer wrong"})[0] == 403
+        assert {p.name: p.read_bytes() for p in Path(self.tmp.name).iterdir()} == before
+        assert self.cal.list() == [booking]
+        restarted = Calendar(self.cal.path, ["GPU-a", "GPU-b"])
+        assert restarted.list() == [booking]
+
+    def test_access_and_writes_share_constant_time_comparison(self):
+        for path, method, body, expected in [
+                ("/reservation-access", "GET", None, 200),
+                ("/reserve", "POST", record(), 201),
+                ("/reservations/missing", "PATCH", record(), 404),
+                ("/unreserve", "POST", {"id": "missing"}, 404)]:
+            with patch("hmac.compare_digest", wraps=hmac.compare_digest) as compare:
+                assert self.call(path, method, body, {"Authorization": "Bearer secret"})[0] == expected
+                compare.assert_called_once_with(b"secret", b"secret")
+            with patch("hmac.compare_digest", return_value=False) as compare:
+                assert self.call(path, method, body, {"Authorization": "Bearer secret"})[0] == 403
+                compare.assert_called_once_with(b"secret", b"secret")
+
+    def test_access_does_not_authorize_later_requests_or_other_routes(self):
+        auth = {"Authorization": "Bearer secret"}
+        assert self.call("/reservation-access", headers=auth) == (200, {"writable": True})
+        for path, method, body in [("/reserve", "POST", record()),
+                                   ("/reservations/missing", "PATCH", record()),
+                                   ("/unreserve", "POST", {"id": "missing"})]:
+            assert self.call(path, method, body)[0] == 401
+        assert self.call("/reservation-access", "POST", {}, auth)[0] == 405
+        assert self.call("/reservation-access/missing", headers=auth)[0] == 404
+        assert self.call("/reservations/missing", headers=auth)[0] == 405
+        assert self.cal.list() == []
 
     def test_recurring_crud_actual_status_gaps_and_rollback(self):
         auth = {"Authorization": "Bearer secret"}

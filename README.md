@@ -191,13 +191,16 @@ atomic multi-GPU conflict checks and edits across connections.
 All token holders may create, edit and cancel bookings for **any owner**. This is
 trusted-lab management, not per-user authorization. Docker labels are advisory
 identity data; a trusted launch workflow must control them. The token never
-establishes human identity. Use `Authorization: Bearer <token>` for writes. If a
-proxy requires Basic Auth on the same request, keep Basic Auth and send the token
-in `X-Patroller-Reservation-Token` instead. The dedicated header takes precedence.
-Avoid exposing tokens in shell history, logs or browser-visible configuration.
+establishes human identity. Use `Authorization: Bearer <token>` for writes and
+credential verification. If a proxy requires Basic Auth on the same request, keep
+Basic Auth and send the token in `X-Patroller-Reservation-Token` instead. The
+dedicated header takes precedence, even when empty or invalid; an otherwise valid
+Bearer token does not override it. Avoid exposing tokens in shell history, logs
+or browser-visible configuration.
 
 | Method/path | Body | Success |
 | --- | --- | --- |
+| `GET /reservation-access` | none; write credential in headers | 200, `{"writable":true}` |
 | `GET /reservations` | none | 200, array including past bookings |
 | `POST /reserve` | all editable fields | 201, created record |
 | `PATCH /reservations/<id>` | all editable fields | 200, updated record retaining id |
@@ -244,6 +247,37 @@ curl -X POST http://127.0.0.1:8080/reserve \
 # Edit by PATCHing the full editable object to /reservations/<returned-id>.
 # Cancel with POST /unreserve and {"id":"<returned-id>"} using the same credential.
 ```
+
+### Nonmutating write-token verification
+
+`GET /reservation-access` verifies the configured `PATROLLER_RESERVATION_TOKEN`
+using the same header selection and constant-time comparison as reservation
+writes. Send the token in a header, **never in a backend URL**. Success returns
+exactly `{"writable":true}`; errors are generic JSON and never echo credentials:
+
+- 401: configured token exists, but no credential was supplied (or the selected
+  header is empty).
+- 403: credential is invalid, or the backend token is unset/empty (writes disabled).
+- 503: reservation calendar is disabled, regardless of supplied credentials.
+
+This verifies write authorization only, not storage health or booking validity.
+It performs no calendar read/transaction, creates no test booking, changes no
+records and grants no persistent server-side session. Every subsequent write
+still needs its own credential. Existing `/reservations`, `/status` and `/devices`
+reads retain their prior authentication behavior. Clients must stay read-only if
+verification fails or an older backend returns 404; never infer permission from
+successful public reads or probe access by making a fake booking.
+
+For browser clients, prefer a masked token input kept only in that browser
+session. A WebUI entry URL such as `/reservations?write-token=<token>` can expose
+the token in initial proxy/access logs and browser history even if the WebUI
+removes the query parameter immediately. Removing it does not erase those copies.
+Keep HTTPS, proxy Basic Auth and network restrictions unchanged. Browser session
+clearing affects only that session; actual revocation requires rotating the
+backend configuration token. If the same token is configured on multiple nodes,
+any holder can manage **any owner's bookings on all those nodes**; verify access
+on each selected node. Tokens are not human identity or enforcement/kill settings.
+This endpoint does not distribute credentials or change backend configuration.
 
 ### Bounded recurring reservations
 
